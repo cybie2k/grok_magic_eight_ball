@@ -1,0 +1,1 @@
+We are writing code in Python 3.14.7. Any GUIs will be created with Tk. For any third party libraries, provide the needed command line to install them with PIP.
