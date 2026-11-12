@@ -27,6 +27,9 @@ PROGRAM FLOW
 3. ``root.mainloop()`` sits and waits for mouse/keyboard events.
 4. Clicking "Shake Ball" calls ``shake()``, which plays a short animation
    and then writes a random fortune into the text box.
+5. The window opens larger than the original layout. One scale factor
+   multiplies the ball, the type, and the padding so the contents fill
+   that window. Dragging the window border applies the same scale again.
 """
 
 # ---------------------------------------------------------------------------
@@ -100,6 +103,50 @@ WINDOW_BLUE = "#0e2248" # fortune window (the "liquid" inside the ball)
 WINDOW_INK = "#f4f6fa"  # fortune text drawn on the triangle
 PLACEHOLDER = "Your fortune appears here."
 
+# How much larger than the natural layout the window opens. The natural
+# size is measured at startup (sans-serif faces are wider than the Times
+# layout this file started from, which was about 536×690). Every font, gap,
+# and the ball are multiplied by the same scale so the contents fill it.
+DEFAULT_SCALE = 1.6
+MIN_SCALE = 1.0
+MAX_SCALE = 4.0
+
+# Shake offsets in design pixels, the units of the original 280px ball.
+# _draw_ball multiplies them by the current scale.
+SHAKE_OFFSETS = (
+    (-10, 6),
+    (12, -5),
+    (-9, 8),
+    (10, -6),
+    (-4, 3),
+    (3, -2),
+    (0, 0),
+)
+
+# Sans-serif families, in the order we prefer them. The first one that is
+# actually installed is used for every label, the button, and the ball.
+SANS_FAMILIES = (
+    "DejaVu Sans",
+    "Liberation Sans",
+    "Nimbus Sans",
+    "Noto Sans",
+    "Arial",
+    "Helvetica",
+)
+
+
+def sans_family(root: tk.Misc) -> str:
+    """Return an installed sans-serif family.
+
+    Tk has no generic "sans-serif" name that works on every operating
+    system, so we look for known sans faces and use the first match.
+    """
+    installed = set(tkfont.families(root))
+    for name in SANS_FAMILIES:
+        if name in installed:
+            return name
+    return "Helvetica"
+
 
 class EightBallApp:
     """The whole user interface, stored as one object.
@@ -137,7 +184,9 @@ class EightBallApp:
         self.root = root
         self.root.title("Eight Ball")          # text in the title bar
         self.root.configure(bg=BG)             # window background color
-        self.root.resizable(False, False)      # (width, height) — lock size
+        # The user can resize. _on_root_configure scales the contents to fit.
+        # minsize is set once the scale-1 layout has been measured.
+        self.root.resizable(True, True)
 
         # Application state -------------------------------------------------
         # ``str | None`` means "a string, or None". Before the first shake
@@ -145,64 +194,73 @@ class EightBallApp:
         self._answer: str | None = None
         self._shaking = False   # True while the shake animation is running
         self._shake_step = 0    # which frame of the shake we are on
+        self._scale = 1.0       # 1.0 is the original 536×690 layout
+        self._fitting = False   # True while we are applying a scale
+        self._fit_size: tuple[int, int] | None = None
 
         # Fonts -------------------------------------------------------------
-        # tkfont.Font objects can be reused on many widgets. Creating them
-        # once (instead of passing family= every time) keeps sizes consistent.
-        self._title_font = tkfont.Font(family="Times", size=28, weight="bold")
-        self._label_font = tkfont.Font(family="Helvetica", size=10)
-        self._body_font = tkfont.Font(family="Helvetica", size=12)
-        self._answer_font = tkfont.Font(family="Times", size=18)
-        self._eight_font = tkfont.Font(family="Times", size=42, weight="bold")
-        self._window_font = tkfont.Font(family="Helvetica", size=8, weight="bold")
-        self._button_font = tkfont.Font(family="Helvetica", size=13, weight="bold")
-        self._eyebrow_font = tkfont.Font(family="Helvetica", size=9)
+        # One sans-serif family for the whole window. Font objects are
+        # created once and resized in _apply_scale; widgets that share a
+        # Font pick up the new size automatically.
+        sans = sans_family(root)
+        self._title_font = tkfont.Font(family=sans, size=28, weight="bold")
+        self._label_font = tkfont.Font(family=sans, size=10)
+        self._body_font = tkfont.Font(family=sans, size=12)
+        self._answer_font = tkfont.Font(family=sans, size=18)
+        self._eight_font = tkfont.Font(family=sans, size=42, weight="bold")
+        self._window_font = tkfont.Font(family=sans, size=8, weight="bold")
+        self._button_font = tkfont.Font(family=sans, size=13, weight="bold")
+        self._eyebrow_font = tkfont.Font(family=sans, size=9)
 
         # Outer padding frame ----------------------------------------------
         # A Frame is an invisible (or colored) box that holds other widgets.
         # padx/pady add empty space *inside* the frame, like CSS padding.
-        shell = tk.Frame(root, bg=BG, padx=36, pady=28)
-        # pack() is Tk's simplest layout manager: widgets stack from top
-        # to bottom (by default). expand=True lets the frame grow if the
-        # window is stretched.
-        shell.pack(expand=True)
+        # The outer frame tracks the window. The inner frame keeps its
+        # natural size and is centered in whatever space is left, so a
+        # resize that is wider than it is tall stays balanced.
+        outer = tk.Frame(root, bg=BG)
+        outer.pack(expand=True, fill="both")
+        self._shell = tk.Frame(outer, bg=BG, padx=36, pady=28)
+        self._shell.pack(expand=True)
 
         # Title block -------------------------------------------------------
         # Label is a widget that shows a single string of text.
-        # We do not keep a variable for these labels because we never
-        # change them later. (If we needed to, we would store self.title = ...)
+        # A few labels are stored on self so _apply_scale can adjust their
+        # padding when the window size changes. Their text stays put.
         tk.Label(
-            shell,
+            self._shell,
             text="THE ORACLE",
             bg=BG,
             fg=MUTED,
             font=self._eyebrow_font,
         ).pack()
 
-        tk.Label(
-            shell,
+        self._title = tk.Label(
+            self._shell,
             text="Eight Ball",
             bg=BG,
             fg=FG,
             font=self._title_font,
-        ).pack(pady=(4, 2))  # (top, bottom) padding in pixels
+        )
+        self._title.pack(pady=(4, 2))  # (top, bottom) padding in pixels
 
-        tk.Label(
-            shell,
+        self._subtitle = tk.Label(
+            self._shell,
             text="Hold a yes-or-no question in mind, then shake.",
             bg=BG,
             fg=MUTED,
             font=self._body_font,
             wraplength=360,       # wrap onto the next line after 360 px
             justify="center",
-        ).pack(pady=(0, 16))
+        )
+        self._subtitle.pack(pady=(0, 16))
 
         # The eight-ball drawing -------------------------------------------
         # Canvas is a drawing surface. We paint ovals, a triangle, and text
         # onto it in _draw_ball(). Coordinates are in pixels, origin (0, 0)
         # at the top-left corner of the canvas.
         self.canvas = tk.Canvas(
-            shell,
+            self._shell,
             width=280,
             height=280,
             bg=BG,
@@ -213,19 +271,20 @@ class EightBallApp:
         self._draw_ball()  # first paint: the "8" face, no fortune yet
 
         # Response text box -------------------------------------------------
-        tk.Label(
-            shell,
+        self._response_label = tk.Label(
+            self._shell,
             text="Response",
             bg=BG,
             fg=MUTED,
             font=self._label_font,
             anchor="w",            # west = left-align the label text
-        ).pack(fill="x", pady=(18, 6))  # fill="x" stretches it horizontally
+        )
+        self._response_label.pack(fill="x", pady=(18, 6))  # fill="x" stretches it
 
         # A thin Frame around the Text widget gives us a 1-pixel border.
         # (Text itself has no easy "border color" option.)
         text_wrap = tk.Frame(
-            shell,
+            self._shell,
             bg=CARD,
             highlightbackground="#2a2a30",
             highlightthickness=1,
@@ -266,7 +325,7 @@ class EightBallApp:
         # Notice there are no parentheses: we pass the *function itself*,
         # we do not call it yet. Tkinter will call it later, on click.
         self.shake_btn = tk.Button(
-            shell,
+            self._shell,
             text="Shake Ball",
             command=self.shake,
             font=self._button_font,
@@ -290,6 +349,130 @@ class EightBallApp:
         # lambda ignores it (the leading underscore marks "unused").
         self.root.bind("<Return>", lambda _event: self.shake())  # Enter key
         self.root.bind("<space>", lambda _event: self.shake())   # Space bar
+
+        # Open larger than the original layout, then keep the contents
+        # fitted if the user drags a border. The binding is added after the
+        # widgets exist so the first Configure cannot fire too early.
+        self._layout_for_screen()
+        self.root.bind("<Configure>", self._on_root_configure)
+
+    def _layout_for_screen(self) -> None:
+        """Open a larger window and scale the current layout to fill it.
+
+        The scale-1 size is measured from the widgets, not assumed. Sans-serif
+        faces are wider than the Times layout this file started with, so a
+        hardcoded 536×690 would leave a gap or clip the title. ``DEFAULT_SCALE``
+        is the size we want; a short display clamps it so the title bar stays
+        on screen. The window is then set to the scaled widgets' requested
+        size, which is what "fill the window" means at startup.
+        """
+        self.root.update_idletasks()
+        self._base_w = max(self.root.winfo_reqwidth(), 1)
+        self._base_h = max(self.root.winfo_reqheight(), 1)
+        self.root.minsize(self._base_w, self._base_h)
+
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        max_w = int(screen_w * 0.92)
+        max_h = int(screen_h * 0.88)
+        scale = min(DEFAULT_SCALE, max_w / self._base_w, max_h / self._base_h)
+        scale = max(MIN_SCALE, scale)
+        self._apply_scale(scale)
+        self.root.update_idletasks()
+        width = self.root.winfo_reqwidth()
+        height = self.root.winfo_reqheight()
+        if width > max_w or height > max_h:
+            scale *= min(max_w / width, max_h / height)
+            self._apply_scale(max(MIN_SCALE, scale * 0.99))
+            self.root.update_idletasks()
+            width = self.root.winfo_reqwidth()
+            height = self.root.winfo_reqheight()
+        self.root.geometry(f"{width}x{height}")
+        self._fit_size = (width, height)
+
+    def _on_root_configure(self, event: tk.Event) -> None:
+        """Refit when the window itself changes size.
+
+        Configure fires for child widgets too. ``event.widget is self.root``
+        keeps those out. ``_fitting`` ignores the events caused by our own
+        geometry change, and the 4-pixel slack ignores a one-pixel window-
+        manager adjustment so we do not rescale forever.
+        """
+        if self._fitting or event.widget is not self.root:
+            return
+        if event.width < 100 or event.height < 100:
+            return
+        if self._fit_size is not None:
+            if (
+                abs(event.width - self._fit_size[0]) < 4
+                and abs(event.height - self._fit_size[1]) < 4
+            ):
+                return
+        self._fit_to(int(event.width), int(event.height))
+
+    def _fit_to(self, width: int, height: int) -> None:
+        """Scale every measurement so the layout fits inside ``width`` × ``height``.
+
+        The scale is the smaller of the two axes, compared with the measured
+        scale-1 window. A very wide window letterboxes instead of stretching
+        the ball into an oval. If rounding makes the widgets ask for a few
+        pixels more than the window, the scale is nudged down once.
+        """
+        scale = min(width / self._base_w, height / self._base_h)
+        scale = max(MIN_SCALE, min(scale, MAX_SCALE))
+        self._fitting = True
+        try:
+            self._apply_scale(scale)
+            self.root.update_idletasks()
+            req_w = self.root.winfo_reqwidth()
+            req_h = self.root.winfo_reqheight()
+            if req_w > width or req_h > height:
+                shrink = min(width / req_w, height / req_h)
+                self._apply_scale(max(MIN_SCALE, scale * shrink * 0.99))
+            self._fit_size = (width, height)
+        finally:
+            self._fitting = False
+
+    def _apply_scale(self, scale: float) -> None:
+        """Resize fonts, padding, and the canvas to ``scale``.
+
+        Sizes below are the original design pixels. ``px`` rounds them to
+        a whole number of screen pixels. Shared Font objects update every
+        widget that uses them, including text drawn on the canvas the next
+        time ``_draw_ball`` runs.
+        """
+        self._scale = scale
+
+        def px(design_px: float) -> int:
+            return max(1, int(round(design_px * scale)))
+
+        self._title_font.configure(size=px(28))
+        self._label_font.configure(size=px(10))
+        self._body_font.configure(size=px(12))
+        self._answer_font.configure(size=px(18))
+        self._eight_font.configure(size=px(42))
+        self._window_font.configure(size=max(6, px(8)))
+        self._button_font.configure(size=px(13))
+        self._eyebrow_font.configure(size=px(9))
+
+        self._shell.configure(padx=px(36), pady=px(28))
+        self._title.pack_configure(pady=(px(4), px(2)))
+        self._subtitle.configure(wraplength=px(360))
+        self._subtitle.pack_configure(pady=(0, px(16)))
+        side = px(280)
+        self.canvas.configure(width=side, height=side)
+        self.canvas.pack_configure(pady=px(8))
+        self._response_label.pack_configure(pady=(px(18), px(6)))
+        self.response.configure(padx=px(14), pady=px(12))
+        self.shake_btn.configure(padx=px(16), pady=px(12))
+        self.shake_btn.pack_configure(pady=(px(18), 0), ipady=px(4))
+        self._draw_ball(self._shown_offset())
+
+    def _shown_offset(self) -> tuple[int, int]:
+        """Offset of the frame currently on screen, in design pixels."""
+        if self._shaking and 0 < self._shake_step <= len(SHAKE_OFFSETS):
+            return SHAKE_OFFSETS[self._shake_step - 1]
+        return (0, 0)
 
     def _draw_ball(self, offset: tuple[int, int] = (0, 0)) -> None:
         """Paint the eight-ball onto the canvas.
@@ -315,22 +498,28 @@ class EightBallApp:
         """
         self.canvas.delete("all")
 
-        # Unpack the offset tuple into two names. This is equivalent to:
-        #     ox = offset[0]
-        #     oy = offset[1]
-        ox, oy = offset
+        # ``s`` turns design pixels (the original 280px ball) into screen
+        # pixels. The shake offsets are in those same design pixels.
+        s = self._scale
+        ox = offset[0] * s
+        oy = offset[1] * s
 
-        # Center of the ball. The canvas is 280x280, so 140, 140 is the
-        # middle. Adding ox/oy slides the whole drawing during a shake.
-        cx, cy = 140 + ox, 140 + oy
-        r = 118  # radius of the outer sphere, in pixels
+        def d(design_px: float) -> float:
+            return design_px * s
+
+        # Center of the canvas. Adding ox/oy slides the whole drawing.
+        cw = int(self.canvas["width"])
+        ch = int(self.canvas["height"])
+        cx, cy = cw / 2 + ox, ch / 2 + oy
+        r = d(118)  # radius of the outer sphere
+        stroke = max(1, int(round(d(2))))
 
         # Soft drop shadow: a slightly larger, darker oval shifted down-right.
         self.canvas.create_oval(
-            cx - r + 6,
-            cy - r + 12,
-            cx + r + 6,
-            cy + r + 12,
+            cx - r + d(6),
+            cy - r + d(12),
+            cx + r + d(6),
+            cy + r + d(12),
             fill="#050506",
             outline="",            # empty string = no outline
         )
@@ -342,28 +531,28 @@ class EightBallApp:
             cy + r,
             fill=BALL,
             outline="#2a2a32",
-            width=2,
+            width=stroke,
         )
         # Specular highlight (the "shine" on the upper-left).
         self.canvas.create_oval(
-            cx - 70,
-            cy - 96,
-            cx - 8,
-            cy - 42,
+            cx - d(70),
+            cy - d(96),
+            cx - d(8),
+            cy - d(42),
             fill="#3a3a44",
             outline="",
         )
 
         # The circular "window" cut into the front of a real eight-ball.
-        well_r = 54
+        well_r = d(54)
         self.canvas.create_oval(
-            cx - well_r - 4,
-            cy - well_r - 4,
-            cx + well_r + 4,
-            cy + well_r + 4,
+            cx - well_r - d(4),
+            cy - well_r - d(4),
+            cx + well_r + d(4),
+            cy + well_r + d(4),
             fill="#0c0c10",
             outline="#3a3a42",
-            width=2,
+            width=stroke,
         )
         self.canvas.create_oval(
             cx - well_r,
@@ -378,10 +567,10 @@ class EightBallApp:
         if self._answer and not self._shaking:
             # Blue "liquid" behind the triangle.
             self.canvas.create_oval(
-                cx - well_r + 4,
-                cy - well_r + 4,
-                cx + well_r - 4,
-                cy + well_r - 4,
+                cx - well_r + d(4),
+                cy - well_r + d(4),
+                cx + well_r - d(4),
+                cy + well_r - d(4),
                 fill=WINDOW_BLUE,
                 outline="",
             )
@@ -390,28 +579,28 @@ class EightBallApp:
             # Three points make a triangle, point-down like a real 8-ball die.
             self.canvas.create_polygon(
                 cx,
-                cy + 38,
-                cx - 38,
-                cy - 28,
-                cx + 38,
-                cy - 28,
+                cy + d(38),
+                cx - d(38),
+                cy - d(28),
+                cx + d(38),
+                cy - d(28),
                 fill="#06102a",
                 outline="",
             )
             # ``.upper()`` is a string method: "Yes" becomes "YES".
-            # ``width=70`` tells Tk to wrap the text inside a 70-px column.
+            # ``width`` tells Tk to wrap the text inside that column.
             self.canvas.create_text(
                 cx,
-                cy - 2,
+                cy - d(2),
                 text=self._answer.upper(),
                 fill=WINDOW_INK,
                 font=self._window_font,
-                width=70,
+                width=d(70),
                 justify="center",
             )
         else:
             # Idle face: white circle with a big "8".
-            inner = 36
+            inner = d(36)
             self.canvas.create_oval(
                 cx - inner,
                 cy - inner,
@@ -422,7 +611,7 @@ class EightBallApp:
             )
             self.canvas.create_text(
                 cx,
-                cy + 2,
+                cy + d(2),
                 text="8",
                 fill=BUTTON_FG,
                 font=self._eight_font,
@@ -474,21 +663,13 @@ class EightBallApp:
             clicks — because Tk can only paint when it is inside mainloop.
             ``after()`` hands control back to mainloop between frames.
 
-        ``pattern`` is a tuple of (x, y) offsets, one per frame. The last
-        offset is (0, 0) so the ball settles back in the center.
+        ``SHAKE_OFFSETS`` is a tuple of (x, y) offsets, one per frame. The
+        last offset is (0, 0) so the ball settles back in the center.
+        Those numbers are design pixels; ``_draw_ball`` scales them.
         """
-        pattern = (
-            (-10, 6),
-            (12, -5),
-            (-9, 8),
-            (10, -6),
-            (-4, 3),
-            (3, -2),
-            (0, 0),
-        )
-        if self._shake_step < len(pattern):
+        if self._shake_step < len(SHAKE_OFFSETS):
             # Draw this frame, then bump the counter for next time.
-            self._draw_ball(pattern[self._shake_step])
+            self._draw_ball(SHAKE_OFFSETS[self._shake_step])
             self._shake_step += 1
             # 80 milliseconds ≈ 12 frames per second. Fast enough to look
             # like a shake, slow enough to see.
@@ -553,14 +734,21 @@ def main() -> None:
             # meaning width x height + x_offset + y_offset.
             root.geometry(f"{sw}x{sh}+0+0")
     else:
+        # Before the window is on screen, winfo_width() can still be 1.
+        # The fitted size is the requested size in that case. Including
+        # width and height in geometry() keeps the larger size while we
+        # move the window to the center.
         width = root.winfo_width()
         height = root.winfo_height()
+        if width <= 1 or height <= 1:
+            width = root.winfo_reqwidth()
+            height = root.winfo_reqheight()
         # Integer division // so we get a whole number of pixels.
         # max(..., 0) keeps the window on-screen if it is larger than
         # the display (otherwise x or y could go negative).
         x = max((root.winfo_screenwidth() - width) // 2, 0)
         y = max((root.winfo_screenheight() - height) // 2, 0)
-        root.geometry(f"+{x}+{y}")
+        root.geometry(f"{width}x{height}+{x}+{y}")
 
     root.mainloop()
 
